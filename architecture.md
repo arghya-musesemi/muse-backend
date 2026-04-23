@@ -712,20 +712,21 @@ sequenceDiagram
 muse-backend/
 ├── app/
 │   ├── __init__.py
-│   ├── main.py                              # FastAPI app factory, middleware, route registration
+│   ├── main.py                              # FastAPI app factory, middleware, route registration; calls observability.init_sentry() + configure_structlog()
 │   ├── core/
 │   │   ├── __init__.py
-│   │   ├── config.py                        # Pydantic BaseSettings (env + Secret Manager resolution)
-│   │   ├── security.py                      # JWT decode/verify, get_current_user dependency
+│   │   ├── config.py                        # Pydantic BaseSettings (env + Secret Manager resolution); includes SENTRY_DSN, SENTRY_ENVIRONMENT, GCS_PDF_BUCKET, GIT_SHA
+│   │   ├── observability.py                 # Sentry SDK init, structlog config, PII-scrubbing before_send hook. Imported by both main.py and worker/celery_app.py
+│   │   ├── security.py                      # JWT decode/verify, get_current_user dependency, HMAC signature verifiers (HubSpot v3, QBO)
 │   │   └── exceptions.py                    # Custom HTTP exceptions
 │   ├── db/
 │   │   ├── __init__.py
-│   │   ├── session.py                       # SQLAlchemy async engine, sessionmaker, get_db dependency
+│   │   ├── session.py                       # Dual SQLAlchemy engines: async (asyncpg) for FastAPI, sync (psycopg2) for Celery. Pool sizing per §10.4. Exposes get_db (async) + get_sync_db (sync)
 │   │   ├── base.py                          # Declarative base
 │   │   └── models/
 │   │       ├── __init__.py
 │   │       ├── auth.py                      # User, MagicLink
-│   │       ├── core.py                      # Company, Contact, Deal, PipelineStage, Invoice, ...
+│   │       ├── core.py                      # Company, Contact, Deal, PipelineStage, Invoice, Estimate, PurchaseOrder, MappingBookmark
 │   │       ├── raw_sync.py                  # HubspotRecord, QboRecord, SyncRun, WebhookEvent
 │   │       └── qbo.py                       # OAuthToken
 │   ├── api/
@@ -737,54 +738,75 @@ muse-backend/
 │   │       ├── auth.py                      # /auth/magic-link, /auth/verify, /auth/logout
 │   │       ├── deals.py                     # /deals, /deals/{id}
 │   │       ├── companies.py                 # /companies
-│   │       ├── invoices.py                  # /invoices, /invoices/{id}/pdf
-│   │       ├── estimates.py                 # /estimates, /estimates/{id}/pdf
+│   │       ├── invoices.py                  # /invoices, /invoices/{id}/pdf  (cache-first via pdf_cache_service, §5.6)
+│   │       ├── estimates.py                 # /estimates, /estimates/{id}/pdf  (cache-first via pdf_cache_service, §5.6)
 │   │       ├── purchase_orders.py           # /purchase-orders
 │   │       ├── sync_status.py               # /sync/status
 │   │       ├── admin.py                     # /admin/users, /admin/qbo/connect, /admin/qbo/callback
-│   │       ├── webhooks.py                  # /webhooks/hubspot, /webhooks/qbo
+│   │       ├── webhooks.py                  # /webhooks/hubspot, /webhooks/qbo  (HMAC verify -> 200 -> queue Celery task)
 │   │       └── health.py                    # /health
 │   ├── worker/
 │   │   ├── __init__.py
-│   │   ├── celery_app.py                    # Celery + Beat initialization, broker config
-│   │   ├── tasks_hubspot_sync.py            # Hourly HubSpot sync tasks
-│   │   ├── tasks_qbo_sync.py               # Hourly QBO sync tasks
-│   │   ├── tasks_hubspot_webhook.py         # HubSpot webhook processing
-│   │   ├── tasks_qbo_webhook.py             # QBO webhook processing
-│   │   ├── tasks_mapping.py                 # raw_sync -> core mapping logic
-│   │   └── tasks_maintenance.py             # Cleanup expired magic links, etc.
+│   │   ├── celery_app.py                    # Celery initialization, broker config, RedBeat scheduler wiring, observability.init_sentry()
+│   │   ├── tasks_hubspot_sync.py            # Hourly HubSpot sync tasks (contacts, companies, deals, associations) + run_hourly_hubspot_sync orchestrator
+│   │   ├── tasks_qbo_sync.py                # Hourly QBO sync tasks (CDC-based; propagates status='Deleted' to raw_sync.qbo_records.deleted_at)
+│   │   ├── tasks_hubspot_webhook.py         # HubSpot webhook processing (including *.deletion events setting deleted_at)
+│   │   ├── tasks_qbo_webhook.py             # QBO webhook processing (including PDF cache invalidation, §5.6)
+│   │   ├── tasks_mapping.py                 # raw_sync -> core mapping logic; uses core.mapping_bookmarks; applies chronological guard + field-ownership dict
+│   │   ├── tasks_reconcile.py               # reconcile_hubspot_deletions (weekly, §6.5); room for future safety-net reconciles
+│   │   └── tasks_maintenance.py             # cleanup_expired_magic_links (daily); cleanup_orphan_pdfs (monthly, §5.6)
 │   ├── integrations/
 │   │   ├── __init__.py
-│   │   ├── hubspot.py                       # HubSpot API client (refactored from hsapi_token.py)
-│   │   ├── qbo.py                           # QBO API client (refactored from qbo_module)
-│   │   ├── qbo_oauth.py                     # QBO OAuth flow (connect, callback, token refresh)
+│   │   ├── hubspot.py                       # HubSpot API client (refactored from hsapi_token.py); paged iterators + rate-limit + 429 backoff
+│   │   ├── qbo.py                           # QBO API client (refactored from qbo_module); CDC-based iterators; transparent token refresh
+│   │   ├── qbo_oauth.py                     # QBO OAuth flow (connect, callback); refresh under pg_advisory_xact_lock with same-tx write-back
+│   │   ├── gcs.py                           # GCS client for the PDF cache: upload, V4 signed URL, delete, list-by-prefix
 │   │   ├── resend_email.py                  # Send magic link emails via Resend
-│   │   └── gcp_secrets.py                   # getSecret(): env -> cache -> Secret Manager
+│   │   └── gcp_secrets.py                   # get_secret(): env -> in-memory cache -> Secret Manager (short-circuits to os.environ in local dev)
 │   └── services/
 │       ├── __init__.py
 │       ├── auth_service.py                  # Magic link creation, verification, session management
 │       ├── deal_service.py                  # Deal queries, access control, grouping by company
-│       ├── invoice_service.py               # Invoice queries, PDF proxy
-│       └── mapping_service.py               # raw_sync -> core transformation logic
+│       ├── invoice_service.py               # Invoice/estimate/PO read queries; delegates PDF handling to pdf_cache_service
+│       ├── pdf_cache_service.py             # Cache-first PDF flow shared by invoices + estimates (§5.6): check core.*.pdf_gcs_path, mint signed URL, else fetch+upload+persist
+│       └── mapping_service.py               # raw_sync -> core transformation; HUBSPOT_OWNED_FIELDS / QBO_OWNED_FIELDS ownership dicts
 ├── alembic/
-│   ├── env.py                               # Alembic environment config
+│   ├── env.py                               # Alembic environment config: include_schemas=True, version_table_schema='public', compare_type=True
 │   ├── versions/
-│   │   └── 001_create_schemas_and_tables.py # Initial migration
+│   │   └── 001_create_schemas_and_tables.py # Initial migration: all four schemas + mapping_bookmarks + source_updated_at + deleted_at + PDF cache columns + partial indexes
 │   └── script.py.mako
 ├── alembic.ini
+├── scripts/
+│   └── export_openapi.py                    # Import FastAPI app, dump /openapi.json to stdout. Used by CI (§15.2) to produce the SDK input artifact without booting a server
 ├── tests/
-│   ├── conftest.py                          # pytest fixtures (test DB, test client, factory functions)
+│   ├── conftest.py                          # pytest fixtures: testcontainers Postgres + Redis, async + sync db sessions, httpx test client, webhook payload factories
 │   ├── test_auth.py
 │   ├── test_deals.py
-│   ├── test_webhooks.py
+│   ├── test_webhooks.py                     # Includes signed + unsigned + replayed webhook cases; asserts 403 on bad HMAC
 │   ├── test_sync_tasks.py
-│   └── test_mapping.py
+│   ├── test_mapping.py                      # Chronological guard, field-ownership dict, mapping_bookmarks advancement
+│   ├── test_reconcile.py                    # reconcile_hubspot_deletions correctness + cleanup_orphan_pdfs
+│   ├── test_pdf_cache.py                    # pdf_cache_service: cache hit, cache miss, webhook-triggered invalidation, signed URL shape
+│   ├── test_qbo_oauth.py                    # Advisory-lock refresh: concurrent refresh test under real Postgres
+│   └── test_contract.py                     # schemathesis run against /openapi.json (§14.2); property-based
+├── .github/
+│   └── workflows/
+│       ├── ci.yml                           # ruff lint + mypy + unit tests + integration tests + schemathesis contract tests
+│       └── openapi-artifact.yml             # On merge to main: run scripts/export_openapi.py, upload openapi.json as a build artifact for muse-portal to consume (§15.2)
 ├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml                       # Local dev: FastAPI + Celery + Redis + Postgres
+├── Dockerfile                               # Single image; Cloud Run service selects API | worker | beat via command override
+├── docker-compose.yml                       # Local dev: FastAPI + Celery worker + RedBeat + Postgres + Redis
 ├── .env.example
 └── README.md
 ```
+
+### 8.1 Notes on the Layout
+
+- **`app/core/observability.py` is the single init point for Sentry and structlog.** Both `main.py` (API) and `worker/celery_app.py` (worker + beat) import and call it so PII scrubbing, sample rates, release tagging, and log-format settings are defined once.
+- **`app/services/pdf_cache_service.py` is shared between invoices and estimates.** The cache-first flow is identical for both; duplicating it in two endpoint files would guarantee drift. The service takes the `core` row (invoice or estimate) and the QBO client as inputs.
+- **`app/worker/tasks_reconcile.py` is deliberately separate from `tasks_hubspot_sync.py`.** Reconciles are weekly safety nets with different failure semantics than hourly incremental sync (a reconcile failure is a pager event; an hourly-sync failure is a retry event). Keeping them in separate files prevents a reviewer from accidentally applying sync-task boilerplate (short retries, high concurrency) to a reconcile task.
+- **`scripts/export_openapi.py`** imports the FastAPI app and calls `app.openapi()` directly. This avoids booting an HTTP server in CI just to curl `/openapi.json`.
+- **`.github/workflows/openapi-artifact.yml`** only runs on merges to `main`. The `muse-portal` repo's own Action downloads this artifact and regenerates its SDK (§15.2). This is the single point of contact between the two repos.
 
 ---
 
