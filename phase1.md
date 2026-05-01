@@ -97,6 +97,30 @@ Local `-c 2` on the worker matches architecture §10.3 (lighter than prod `-c 4`
 
 `app/integrations/gcp_secrets.py` — the `env var → in-memory cache → GCP Secret Manager` resolver. Short-circuit to `os.environ` when `GOOGLE_CLOUD_PROJECT` is unset so local `docker compose up` works without GCP credentials.
 
+#### 3.4.1 Email Provider Boundary (Phase-2 Auth Ready)
+
+Auth endpoints are out of scope for Phase 1 (§1), but the project structure should reserve the email abstraction now so Phase 2 magic-link work does not couple auth logic to one vendor.
+
+Place the app-facing abstraction in `app/services/email.py`:
+
+```python
+from typing import Protocol
+
+class EmailSender(Protocol):
+    def send_magic_link(self, to_email: str, url: str) -> None: ...
+
+def get_email_sender() -> EmailSender: ...
+
+def send_magic_link_email(to_email: str, url: str) -> None: ...
+```
+
+Provider SDKs live in `app/integrations/`, not in `auth_service.py`:
+
+- `app/integrations/resend_email.py` — default implementation for `EMAIL_PROVIDER=resend`.
+- `app/integrations/sendgrid_email.py` — optional future implementation if SendGrid becomes necessary.
+
+`auth_service.py` calls `send_magic_link_email(...)` and must never import `resend`, `sendgrid`, or vendor SDK objects directly. `app/core/config.py` declares `EMAIL_PROVIDER` (default `resend`), `FROM_EMAIL`, and provider-specific secrets such as `RESEND_API_KEY`; provider-specific secrets are required only when that provider is selected. Magic-link emails should disable click/open tracking where the provider supports it, because scanner-prefetch behavior can consume or expose auth links.
+
 ### 3.5 SQLAlchemy Models
 
 Layout per architecture §8:
@@ -654,7 +678,7 @@ The mapper only writes those columns. When Phase 2 starts you tune the set, not 
 
 Rather than build HubSpot fully then QBO fully, interleave for faster feedback:
 
-1. **Foundation** (§3): deps (done), Dockerfile fix, `docker-compose.yml` mirroring prod (RedBeat scheduler + `-Q high_priority,default,low_priority` on the worker, architecture.md §10.3), `config.py` (including `HUBSPOT_WEBHOOK_URL` + `PORTAL_ORIGIN`), `gcp_secrets.py`, `db/models/types.py` (EncryptedToken decorator), `db/session.py`, `db/models/*` (incl. `DealContact`, `DealCompany`, `PipelineStage`), initial Alembic migration + data migration seeding `core.pipeline_stages` (§3.6), `celery_app.py` with `task_routes` (§3.7). Verify end-to-end with a trivial `ping` task that returns `now()` from the DB.
+1. **Foundation** (§3): deps (done), Dockerfile fix, `docker-compose.yml` mirroring prod (RedBeat scheduler + `-Q high_priority,default,low_priority` on the worker, architecture.md §10.3), `config.py` (including `HUBSPOT_WEBHOOK_URL`, `PORTAL_ORIGIN`, `EMAIL_PROVIDER`, `FROM_EMAIL`, and provider-specific email secrets), `gcp_secrets.py`, the Phase-2-ready `app/services/email.py` boundary (§3.4.1), `db/models/types.py` (EncryptedToken decorator), `db/session.py`, `db/models/*` (incl. `DealContact`, `DealCompany`, `PipelineStage`), initial Alembic migration + data migration seeding `core.pipeline_stages` (§3.6), `celery_app.py` with `task_routes` (§3.7). Verify end-to-end with a trivial `ping` task that returns `now()` from the DB.
 2. **HubSpot vertical slice #1:** integration client + `sync_hubspot_companies` (on the `default` queue) + raw-table upsert + one beat schedule entry. Confirm `raw_sync.hubspot_records` fills up.
 3. **QBO OAuth via CLI** (architecture.md §5.3, §16 step 5a): `app/integrations/qbo_oauth.py` + `scripts/qbo_connect.py` + `qbo.oauth_tokens` with Fernet-encrypted token columns + refresh-with-advisory-lock. Run the CLI against the Intuit sandbox before any QBO sync code, so redirect-URI / sandbox-credential quirks surface in week 1. **Do not add public HTTP endpoints for connect/callback in Phase 1** -- those land in Phase 2 with the JWT middleware.
 4. **Pipeline stages end-to-end:** `sync_hubspot_pipeline_stages` task + `pipeline_stage` phase in the mapper + the `(hubspot, pipeline_stage)` bookmark. Confirm renaming a stage in HubSpot sandbox propagates into `core.pipeline_stages` within 24 h and that an already-seeded row gets `hubspot_stage_id` populated on the first task run.
@@ -676,6 +700,7 @@ Not called out in `architecture.md` but come up immediately in code:
 - **Bootstrap vs incremental.** The first run of each sync backfills everything. For HubSpot, check for an absent prior `sync_run`; if none, set `window_start = None` and page through all records. For QBO, use `/query` on bootstrap and `/cdc` on the normal incremental path -- and fall back to `/query` if the last successful run is more than 29 days old. See §5.3 for the decision rule.
 - **Queue routing.** Primary mechanism is `celery_app.conf.task_routes` in `celery_app.py` (§3.7); per-declaration `@shared_task(queue=...)` is still acceptable and overrides `task_routes`. Webhooks -> `high_priority`, hourly syncs + batch mapping -> `default`, weekly/monthly reconciles and cleanup -> `low_priority` (architecture.md §6.6). An unrouted task goes to Celery's default `celery` queue and bypasses the priority pull order.
 - **QBO token encryption.** Tokens in `qbo.oauth_tokens` are app-level encrypted via Fernet at the SQLAlchemy `TypeDecorator` boundary (architecture.md §4.5). Business logic sees plaintext; no `.encrypt()` / `.decrypt()` calls outside `app/db/models/types.py`. `QBO_TOKEN_ENCRYPTION_KEY` must be set before the first OAuth callback, or writes will fail.
+- **Email provider abstraction.** Keep `app/services/email.py` as the only app-facing email API. Resend is the default implementation for magic links; SendGrid remains a provider-level swap in `app/integrations/sendgrid_email.py`, not a reason to change auth logic.
 - **QBO OAuth in Phase 1 is CLI-only** (architecture.md §5.3, §16). `scripts/qbo_connect.py` on a developer's workstation does the OAuth dance; the public `/v1/admin/qbo/connect` + `/callback` endpoints are Phase 2. No JWT yet, so no public OAuth.
 - **Join tables are the association source of truth.** `core.deal_contacts` and `core.deal_companies` drive deal visibility (architecture.md §5.2 canonical query, §7.4). `core.deals.contact_id` is a display-only hint for the primary contact; never use it for authorization.
 - **Pipeline stages = seed + sync.** Static seed at migration time (§3.6), daily sync afterwards (§3.7). Portal must never render an empty stage dropdown, even before the first `sync_hubspot_pipeline_stages` has run.

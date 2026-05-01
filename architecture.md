@@ -30,7 +30,7 @@ After this project is complete:
 | **Database** | PostgreSQL 15+ on Cloud SQL | Four schemas: `auth`, `core`, `raw_sync`, `qbo` |
 | **Object Storage** | GCS bucket `muse-qbo-pdfs` | Cached QBO invoice/estimate PDFs (§5.6) |
 | **Secrets** | GCP Secret Manager (env fallback) | Same resolution pattern as the current Portal (`env -> cache -> Secret Manager`) |
-| **Email** | Resend (`resend` Python SDK) | Magic link emails (ported from Portal's `modules/email/`) |
+| **Email** | Resend (`resend` Python SDK) behind `app/services/email.py` | Magic link emails. Auth code depends on an internal `EmailSender` abstraction, not a vendor SDK, so SendGrid or another provider can be swapped without touching auth flow logic (§7.1) |
 | **Logging** | `structlog` + GCP Cloud Logging | Structured JSON logs, auto-ingested on Cloud Run |
 | **Error Tracking** | Sentry (`sentry-sdk[fastapi,celery,sqlalchemy]`) | Unhandled exceptions, slow-query breadcrumbs, release tagging for regression attribution (§13.2) |
 | **API Contract** | OpenAPI 3.1 (FastAPI-generated) + Schemathesis + `openapi-typescript-codegen` | The portal imports a generated TypeScript SDK so backend field renames are caught at `tsc` time (§14.2, §15) |
@@ -833,7 +833,7 @@ sequenceDiagram
     participant Portal as muse-portal
     participant API as muse-backend
     participant DB as PostgreSQL
-    participant Email as Resend
+    participant Email as EmailSender
 
     User->>Portal: Enter email on /login
     Portal->>API: POST /v1/auth/magic-link { email }
@@ -858,6 +858,13 @@ sequenceDiagram
         API-->>Portal: 401
     end
 ```
+
+**Email provider boundary.** Auth code calls `app/services/email.py`, which exposes an app-facing `EmailSender` protocol and `send_magic_link_email(to_email, url)` helper. Provider-specific SDK calls live under `app/integrations/`:
+
+- `app/integrations/resend_email.py` is the default Phase 2 implementation.
+- `app/integrations/sendgrid_email.py` may be added later if deliverability, analytics, subuser management, or enterprise support justify SendGrid.
+
+`auth_service.py` must not import `resend`, `sendgrid`, or any vendor SDK directly. This keeps magic-link creation, token hashing, and session behavior independent from the email vendor. Provider selection is config-driven, e.g. `EMAIL_PROVIDER=resend`, and provider secrets are validated only when that provider is selected.
 
 ### 7.2 JWT Session Cookie (backend-sole authority)
 
@@ -1028,11 +1035,13 @@ muse-backend/
 │   │   ├── qbo.py                           # QBO API client (refactored from qbo_module); CDC-based iterators; transparent token refresh
 │   │   ├── qbo_oauth.py                     # QBO OAuth flow (connect, callback); refresh under pg_advisory_xact_lock with same-tx write-back
 │   │   ├── gcs.py                           # GCS client for the PDF cache: upload, V4 signed URL, delete, list-by-prefix
-│   │   ├── resend_email.py                  # Send magic link emails via Resend
+│   │   ├── resend_email.py                  # Resend implementation of the EmailSender provider boundary
+│   │   ├── sendgrid_email.py                # Optional future SendGrid implementation; not required while EMAIL_PROVIDER=resend
 │   │   └── gcp_secrets.py                   # get_secret(): env -> in-memory cache -> Secret Manager (short-circuits to os.environ in local dev)
 │   └── services/
 │       ├── __init__.py
 │       ├── auth_service.py                  # Magic link creation, verification, session management
+│       ├── email.py                         # EmailSender protocol + provider factory + send_magic_link_email(); auth imports this, never vendor SDKs directly
 │       ├── deal_service.py                  # Deal queries, access control, grouping by company
 │       ├── invoice_service.py               # Invoice/estimate/PO read queries; delegates PDF handling to pdf_cache_service
 │       ├── pdf_cache_service.py             # Cache-first PDF flow shared by invoices + estimates (§5.6): check core.*.pdf_gcs_path, mint signed URL, else fetch+upload+persist
@@ -1071,6 +1080,7 @@ muse-backend/
 ### 8.1 Notes on the Layout
 
 - **`app/core/observability.py` is the single init point for Sentry and structlog.** Both `main.py` (API) and `worker/celery_app.py` (worker + beat) import and call it so PII scrubbing, sample rates, release tagging, and log-format settings are defined once.
+- **`app/services/email.py` is the app-facing email boundary.** `auth_service.py` creates magic links and calls `send_magic_link_email(...)`; provider SDKs stay in `app/integrations/resend_email.py` or a future `app/integrations/sendgrid_email.py`. The service also centralizes auth-email defaults: no click/open tracking for magic links, dedicated sender domain, conservative retry policy, and sanitized logging with no raw token leakage.
 - **`app/services/pdf_cache_service.py` is shared between invoices and estimates.** The cache-first flow is identical for both; duplicating it in two endpoint files would guarantee drift. The service takes the `core` row (invoice or estimate) and the QBO client as inputs.
 - **`app/worker/tasks_reconcile.py` is deliberately separate from `tasks_hubspot_sync.py`.** Reconciles are weekly safety nets with different failure semantics than hourly incremental sync (a reconcile failure is a pager event; an hourly-sync failure is a retry event). Keeping them in separate files prevents a reviewer from accidentally applying sync-task boilerplate (short retries, high concurrency) to a reconcile task.
 - **`app/db/models/types.py` holds `EncryptedToken`** (§4.5). Business logic in `app/integrations/qbo_oauth.py` and `app/integrations/qbo.py` reads/writes `OAuthToken.access_token` as a plain `str`; the TypeDecorator does the Fernet round-trip at the SQLAlchemy boundary. Never sprinkle `.encrypt()` / `.decrypt()` calls in services.
@@ -1098,7 +1108,9 @@ All secrets are resolved via `app/integrations/gcp_secrets.py` using the same pa
 | `QBO_REALM_ID` | Default QBO company ID (single-tenant) |
 | `QBO_ENVIRONMENT` | `sandbox` or `production` |
 | `QBO_TOKEN_ENCRYPTION_KEY` | URL-safe base64 32-byte key (Fernet format). App-level encryption for `qbo.oauth_tokens.access_token` and `refresh_token` (§4.5). Generate with `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"`. For rotation, supply multiple keys comma-separated; the first is used to encrypt, all are tried for decryption (MultiFernet) |
-| `RESEND_API_KEY` | Resend email service |
+| `EMAIL_PROVIDER` | Email provider selected by `app/services/email.py`; default `resend`. Supported value initially: `resend` |
+| `RESEND_API_KEY` | Resend email service. Required only when `EMAIL_PROVIDER=resend` |
+| `SENDGRID_API_KEY` | Optional future SendGrid email service. Required only if `EMAIL_PROVIDER=sendgrid` |
 | `FROM_EMAIL` | Sender address for magic links |
 | `GOOGLE_CLOUD_PROJECT` | GCP project ID (for Secret Manager) |
 | `GCS_PDF_BUCKET` | GCS bucket name for cached QBO PDFs (§5.6), e.g. `muse-qbo-pdfs` |
@@ -1292,7 +1304,7 @@ The existing `python_applications` (now `muse-scripts`) codebase has ~40 operati
 | `box_webhook_listener/` | `app/api/v1/webhooks.py` + `app/worker/tasks_box.py` | Phase 1 (already uses Flask + Redis + RQ) |
 | `hs_to_qbo.py` | `app/worker/tasks_mapping.py` | Phase 2 |
 | `milestone_emails/` | `app/worker/tasks_notifications.py` | Phase 2 |
-| `modules/gmail_module/sendmail.py` | `app/integrations/resend_email.py` (replace Gmail with Resend) | Phase 2 |
+| `modules/gmail_module/sendmail.py` | `app/services/email.py` + `app/integrations/resend_email.py` (replace Gmail with Resend behind provider boundary; optional future SendGrid implementation stays isolated) | Phase 2 |
 | `modules/muse_utility/` | Shared constants move into `app/core/config.py` | Phase 1 |
 
 Scripts that interact with TSMC, FedEx, KLayout, Calibre, etc. remain in `muse-scripts` until there is a clear reason to migrate them.
